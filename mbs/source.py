@@ -9,8 +9,7 @@ from robustify.robustify import (
 
 from target import (
     EbsSnapshotReference, LVMSnapshotReference, BlobSnapshotReference,
-    CompositeBlockStorageSnapshotReference, GcpDiskSnapshotReference,
-    ManagedDiskSnapshotReference
+    CompositeBlockStorageSnapshotReference, GcpDiskSnapshotReference
     )
 from mbs import get_mbs
 import errors as mbs_errors
@@ -22,12 +21,8 @@ import rfc3339
 import date_utils
 
 from boto.ec2 import connect_to_region
-from azure.storage.blob.baseblobservice import BaseBlobService
-from azure.mgmt.compute.compute_management_client import ComputeManagementClient
+from azure.storage.blob import BlobService
 from azure.common import AzureMissingResourceHttpError
-from azure.common.credentials import ServicePrincipalCredentials
-from azure.mgmt.compute.models import DiskCreateOption
-from msrestazure.azure_exceptions import CloudError
 from apiclient.discovery import build
 from oauth2client.client import SignedJwtAssertionCredentials
 from apiclient.http import HttpRequest, HttpError
@@ -686,14 +681,14 @@ class BlobVolumeStorage(VolumeStorage):
                     "description": urllib.quote(description)}
 
         response = self.blob_service_connection.snapshot_blob(
-            container_name, blob_name, metadata=metadata)
+            container_name, blob_name, x_ms_meta_name_values=metadata)
 
         if not response:
             raise mbs_errors.BlockStorageSnapshotError("Failed to create snapshot from backup source :\n%s" % self)
 
         logger.info("Snapshot successfully created for volume '%s' (%s). "
                     "Snapshot id '%s'." % (self.volume_id, self.volume_name,
-                                           response.snapshot))
+                                           response['x-ms-snapshot']))
 
         # let's grab the snapshot
         blob_ref = None
@@ -701,7 +696,7 @@ class BlobVolumeStorage(VolumeStorage):
         blobs = self.blob_service_connection.list_blobs(
             container_name, prefix=blob_name, include="snapshots")
         for blob in blobs:
-            if blob.snapshot == response.snapshot:
+            if blob.snapshot == response['x-ms-snapshot']:
                 url = self.blob_service_connection.make_blob_url(container_name, blob_name) + \
                       ("?snapshot=%s" % urllib.quote(blob.snapshot))
                 blob_ref = self._new_blob_snapshot_reference(blob, url)
@@ -737,11 +732,15 @@ class BlobVolumeStorage(VolumeStorage):
     ###########################################################################
     def _new_blob_snapshot_reference(self, blob_snapshot, url):
 
+        start_time_str = blob_snapshot.properties.last_modified
+        start_time = datetime.strptime(start_time_str,
+                                       "%a, %d %b %Y %H:%M:%S %Z")
+
         return BlobSnapshotReference(
             snapshot_id=url,
             cloud_block_storage=self,
             status="completed",
-            start_time=blob_snapshot.properties.last_modified.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            start_time=start_time.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             volume_size=(blob_snapshot.properties.content_length /
                          (1024 * 1024 * 1024)),
             progress="100%")
@@ -780,8 +779,8 @@ class BlobVolumeStorage(VolumeStorage):
             self.validate()
             logger.info("Creating connection to blob service for "
                         "volume '%s'" % self.volume_id)
-            conn = BaseBlobService(account_name=self.storage_account,
-                                   account_key=self.access_key)
+            conn = BlobService(account_name=self.storage_account,
+                               account_key=self.access_key)
 
             logger.info("Connection created successfully to blob "
                         "service for volume '%s'" % self.volume_id)
@@ -813,151 +812,13 @@ class BlobVolumeStorage(VolumeStorage):
 
     ###########################################################################
     def to_document(self, display_only=False):
-        doc = super(BlobVolumeStorage, self).to_document(display_only=display_only)
+        doc = super(BlobVolumeStorage, self).to_document(
+            display_only=display_only)
+
 
         doc.update({
             "_type": "BlobVolumeStorage",
             "storageAccount": self.storage_account
-        })
-
-        return doc
-
-
-###############################################################################
-# Managed Disks
-###############################################################################
-class ManagedDiskVolumeStorage(VolumeStorage):
-
-    ###########################################################################
-    def __init__(self):
-        VolumeStorage.__init__(self)
-        self._encrypted_access_key = None
-        self._location = None
-        self._compute_client = None
-
-    ###########################################################################
-    def do_create_snapshot(self, name, description):
-
-        logger.info("Creating managed disk snapshot (name='%s', desc='%s') for volume "
-                    "'%s' (%s)" %
-                    (name, description, self.volume_id, self.volume_name))
-
-        metadata = {"name": urllib.quote(name),
-                    "description": urllib.quote(description)}
-
-        async_snapshot_creation = self.compute_client.snapshots.create_or_update(
-            resource_group_name=self.volume_id.split('/')[4],
-            snapshot_name=name,
-            snapshot={
-                'location': self.location,
-                'creation_data': {
-                    'create_option': DiskCreateOption.copy,
-                    'source_uri': self.volume_id
-                },
-                'tags': metadata
-            }
-        )
-
-        snapshot = async_snapshot_creation.result()
-
-        if not snapshot:
-            raise mbs_errors.BlockStorageSnapshotError("Failed to create snapshot from backup source :\n%s" % self)
-
-        logger.info("Snapshot successfully created for volume '%s' (%s). "
-                    "Snapshot id '%s'." % (self.volume_id, self.volume_name,
-                                           snapshot.id))
-
-        return self._new_managed_disk_snapshot_reference(snapshot)
-
-    ###########################################################################
-    def delete_snapshot(self, snapshot_ref):
-        snapshot_name = snapshot_ref.snapshot_id.split('/')[-1]
-        try:
-            logger.info("Deleting snapshot '%s' " % snapshot_ref.snapshot_id)
-
-            async_snapshot_creation = self.compute_client.snapshots.delete(
-                resource_group_name=self.volume_id.split('/')[4],
-                snapshot_name=snapshot_name
-            )
-
-            async_snapshot_creation.wait()
-
-            return True
-        except CloudError, ce:
-            if 'NotFound' in ce.error.error:
-                logger.warning("Snapshot '%s' does not exist" % snapshot_ref.snapshot_id)
-                return False
-            else:
-                msg = "Error while deleting snapshot '%s'" % snapshot_ref.snapshot_id
-                logger.exception(msg)
-                raise mbs_errors.BlockStorageSnapshotError(msg, cause=ce)
-
-    ###########################################################################
-    def _new_managed_disk_snapshot_reference(self, snapshot):
-
-        return ManagedDiskSnapshotReference(
-            snapshot_id=snapshot.id,
-            cloud_block_storage=self,
-            status="completed",
-            start_time=snapshot.time_created.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            volume_size=snapshot.disk_size_gb,
-            progress="100%")
-
-    ###########################################################################
-    @property
-    def location(self):
-        return self._location
-
-    @location.setter
-    def location(self, location):
-        self._location = str(location)
-
-    ###########################################################################
-    @property
-    def compute_client(self):
-        if not self._compute_client:
-            self.validate()
-            logger.info("Creating compute client to Azure (ARM) Compute API for "
-                        "volume '%s'" % self.volume_id)
-
-            sp_creds = ServicePrincipalCredentials(self.credentials.get_credential('clientId'),
-                                                   self.credentials.get_credential('clientSecret'),
-                                                   tenant=self.credentials.get_credential('tenantId'))
-            compute_client = ComputeManagementClient(sp_creds, str(self.credentials.get_credential('subscriptionId')))
-
-            logger.info("Client created successfully to Azure (ARM) Compute API "
-                        "service for volume '%s'" % self.volume_id)
-            self._compute_client = compute_client
-
-        return self._compute_client
-
-    ###########################################################################
-    def suspend_io(self):
-        # todo: move this up the parent?
-        logger.info("Suspend IO for volume '%s' using fsfreeze" %
-                    self.volume_id)
-        freeze_mount_point(self.mount_point)
-
-    ###########################################################################
-    def resume_io(self):
-        # todo: move this up the parent?
-        logger.info("Resume io for volume '%s' using fsfreeze" %
-                    self.volume_id)
-
-        unfreeze_mount_point(self.mount_point)
-
-    ###########################################################################
-    def validate(self):
-        if not self.location:
-            raise mbs_errors.ConfigurationError("ManagedDiskVolumeStorage: location is not set")
-
-    ###########################################################################
-    def to_document(self, display_only=False):
-        doc = super(ManagedDiskVolumeStorage, self).to_document(display_only=display_only)
-
-        doc.update({
-            "_type": "ManagedDiskVolumeStorage",
-            "location": self.location
         })
 
         return doc
